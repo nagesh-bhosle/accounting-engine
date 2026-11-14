@@ -53,3 +53,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Scratch notes
+prompt.txt
+llm.txt
