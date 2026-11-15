@@ -1,8 +1,10 @@
 # Accounting Engine — 3-Phase Build Plan
 
-Repo: `/Users/nageshbhosle/sushama-project` → `https://github.com/nagesh-bhosle/accounting-engine` (branch `main`, 2 commits).
+Repo: `/Users/nageshbhosle/sushama-project` → `https://github.com/nagesh-bhosle/accounting-engine` (branch `main`).
 
-Project lives under **`Accounting Engine/`** (repo root stays `sushama-project/`, as you chose). Current contents: `docs/plans/accounting-engine-azure-poc.md` and the interview guide `.docx` (recently moved in from the repo root — still untracked in its new location).
+Project lives under **`Accounting Engine/`** (repo root stays `sushama-project/`, as you chose). Current contents: the two plans in `docs/plans/` and the interview guide `.docx` (tracked in git).
+
+**This plan owns build order, script numbering and locked decisions.** `accounting-engine-azure-poc.md` is the detailed design spec and was re-checked against the interview guide on 2026-11-15 (its §0a lists what was added). Where the two disagree, this plan wins.
 
 **Phasing you defined:**
 1. **Infrastructure** — get everything up, validate it, pause/start scripts, sanity tests.
@@ -101,13 +103,15 @@ Key details, each of which was wrong in an earlier draft and is now verified:
 
 **unity_catalog module**
 - Account-level aliased provider for `databricks_metastore` + `databricks_metastore_assignment`.
-- Workspace-level provider for `databricks_storage_credential`, `databricks_external_location`, catalogs/schemas.
+- Workspace-level provider for `databricks_storage_credential`, one `databricks_external_location` per lake container (`bronze`, `silver`, `gold`, `exports`, `_control`), catalogs/schemas.
+- Grants per the guide's governance model: engineers read/write the engineering schemas, analysts `SELECT` on `gold` only, the job service principal least-privilege (detail in the POC plan §8 Phase 2).
 - Explicit `depends_on` chain: metastore → assignment → credential → external location → catalog → schemas.
 
 **adf module**
 - `ls_adls` (MI), `ls_sftp` (host `<account>.blob.core.windows.net:22`, user `<account>.svc-inbound`, password from KV, **managed Azure IR**), `ls_databricks`, `ls_keyvault`.
 - Pipelines rendered from `adf/pipelines/*.json` so they stay reviewable in git.
-- Daily trigger with retries and a failure-path activity.
+- Daily trigger with retries and a failure-path activity. **In Phase 1 only a sanity pipeline (SFTP → Bronze copy) is deployed and the daily trigger is created stopped** — the Databricks job it calls does not exist until Phase 2.
+- Terraform is the only deployer of ADF objects; `deployment/deploy_adf.sh` (Phase 2) wraps a targeted `terraform apply`.
 
 **Every module ships `outputs.tf`** — the validation scripts and Phase 2 config depend on them.
 
@@ -141,11 +145,11 @@ Behavioural contract for all of them:
 |---|---|
 | Resource groups, all resources | `az resource list` count + Terraform `plan -detailed-exitcode` expecting **0** (proves no drift) |
 | Storage | `az storage container list` returns all 7; HNS on; SFTP enabled state matches `azure.state` |
-| SFTP | real `sftp` connection as **each** local user, `pwd` == its home container, `ls`, and a write/delete probe in its own container |
+| SFTP | real `sftp` connection as **each** local user, `pwd` == its home container, `ls`; `svc-inbound` gets a write/delete probe; `svc-outbound` (no write permission) reads and deletes a probe file seeded through the ADLS API, and a write attempt must be refused |
 | Key Vault | all expected secrets present; `az keyvault secret show` succeeds |
-| ADF | factory reachable, 4 linked services present, pipelines present, trigger enabled state matches `azure.state` |
+| ADF | factory reachable, 4 linked services present, pipelines present, trigger state as expected (stopped throughout Phase 1; from Phase 2 it matches `azure.state`) |
 | Databricks | workspace provisioning state `Succeeded`, cluster policy exists, catalog + 4 schemas visible via CLI |
-| Unity Catalog | metastore assigned, external location valid (`databricks external-location validate` or equivalent) |
+| Unity Catalog | metastore assigned, all 5 external locations valid (`databricks external-location validate` or equivalent), grants present |
 | Monitoring | action group + diagnostic settings attached; budget present with alerts |
 | Cost guardrail | `az consumption budget show` confirms threshold set |
 
@@ -158,8 +162,8 @@ Plus `scripts/lib/` unit-testable helpers so validation logic is testable withou
 - `test_prereqs.py` — every required CLI present and above the version floor.
 - `test_terraform.py` — `terraform fmt -check`, `terraform validate` on every module; `terraform plan` exits 0 (no-op) on a created environment.
 - `test_azure_resources.py` — each resource exists with the expected SKU/config (storage HNS, SFTP state, workspace premium, ADF linked services).
-- `test_sftp_roundtrip.py` — upload via the real script, list it, read it back, verify sha256, delete it — for both local users.
-- `test_rbac.py` — ADF MI and access connector hold Blob Data Contributor; SFTP local users have **no** access to `gold`/`silver`/`_control` (asserts the permission-scope boundary).
+- `test_sftp_roundtrip.py` — as `svc-inbound`: upload via the real script, list it, read it back, verify sha256, delete it. As `svc-outbound`: fetch a file seeded through the ADLS API, verify sha256, delete it, and assert an upload is refused.
+- `test_rbac.py` — ADF MI and access connector hold Blob Data Contributor; SFTP local users have **no** access to `gold`/`silver`/`_control` (asserts the permission-scope boundary); an analyst-scoped identity can read `gold` and cannot read `silver`.
 - `test_lifecycle.py` — assert pause→`plan` is clean, start→`plan` is clean, and state file transitions are correct. Uses `--dry-run` so it cannot flip a real environment by accident.
 
 Run: `task phase1:test` (or `pytest tests/sanity -m azure`).
@@ -181,29 +185,31 @@ Run: `task phase1:test` (or `pytest tests/sanity -m azure`).
 # PHASE 2 — The real project
 
 - `src/accounting_engine/` — `common` (config, io, spark, logging, control tables), `bronze`, `silver`, `gold`, `export`, `dq`, exactly as specified in `docs/plans/accounting-engine-azure-poc.md`.
+- Guide-driven items added in the 2026-11-15 review (detail in the POC plan §8): additive-vs-breaking schema handling at Bronze, range checks and per-column null policy in Silver, Gold partitioned by processing date (never by schedule date), `gold/accounting_output` as the retained export source, output schema gate before export, late-file alert in ADF, and the performance work (broadcast reference joins, skew handling, `OPTIMIZE`/`VACUUM`).
+- Jenkins: feature branches and PRs run the quality gate only; deployment stages run on `main` after approval.
 - Local/azure path abstraction in `common/io.py`; `dbutils` confined there.
 - Infra variables embedded: `02_attach_config.sh` generates `config/dev/azure.env` + `pipeline.yml`; the app reads only those.
 - Amortization engine (straight-line + declining balance), adjustments with future-period re-amortization, SCD2 account state, reconciliation with control totals, deterministic CSV.GZ export.
 - `databricks.yml` bundle with the 4-task workflow; ADF invokes it via the Jobs API.
 - **Pytest**: `unit` (property-based amortization math via hypothesis), `contract` (layer schemas), `integration` (local Spark + Delta on `file://`), `e2e` (compose SFTP → full pipeline; `-m azure` for real Azure).
 - Skills applied: `spark-and-distributed-processing`, `lakehouse-table-format-engineering`, `data-quality-and-contract-testing`, `warehouse-and-schema-design`, `airflow-and-workflow-orchestration`.
-- Docs: `README.md`, `docs/HOW_TO_RUN.md`, `docs/HLD.md`, `docs/LLD.md`, `docs/COMPONENTS_AND_ALTERNATIVES.md`.
+- Docs: `README.md`, `docs/HOW_TO_RUN.md`, `docs/HLD.md`, `docs/LLD.md`, `docs/COMPONENTS_AND_ALTERNATIVES.md`, `docs/GUIDE_TRACEABILITY.md` (each guide section and Q&A → the file or test that demonstrates it).
 
 ---
 
 # PHASE 3 — Data, analysis, and UI
 
-- `tools/generate_sample_data.py` — on-demand volumes (`--rows/--days/--seed/--region`), `--dirty` for edge cases; wired to `sftp_upload.sh`.
+- `tools/generate_sample_data.py` — on-demand volumes (`--rows/--days/--seed/--region`), `--dirty` for edge cases, `--schema-break rename|drop|retype` for the upstream-schema-change scenario, `--skew` for hot-account data; wired to `sftp_upload.sh`.
 - Analysis: `analysis/` notebooks/scripts for reconciliation trends, DQ pass rates, schedule projections; parquet/Delta reads so it works locally and on Azure.
 - Local lifecycle: `scripts/local/{up.sh,down.sh,pipeline.sh,e2e_azure.sh}` + `docker-compose.dev.yml` (SFTP, local Spark, Jenkins, Streamlit).
-- **Streamlit UI** (`ui/app.py`): one page per phase — Infrastructure (create/pause/start/validate/destroy with live status), Data (generate + upload), Pipeline (run/rerun/force, live run log), Analysis (DQ + reconciliation tables and charts), Docs. Every button shells out to the *same* script the CLI uses, so there is no second implementation to drift. Guardrails: destroy requires typed confirmation, destructive actions show what will happen first, and a long-running action streams logs.
+- **Streamlit UI** (`ui/app.py`) — this replaces the FastAPI monitoring API and `dashboard.html` from the earlier POC draft: one page per phase — Infrastructure (create/pause/start/validate/destroy with live status), Data (generate + upload), Pipeline (run/rerun/force, live run log), Analysis (DQ + reconciliation tables and charts), Docs. Every button shells out to the *same* script the CLI uses, so there is no second implementation to drift. Guardrails: destroy requires typed confirmation, destructive actions show what will happen first, and a long-running action streams logs.
 - `README.md` covering all three phases, plus `docs/` index.
 
 ---
 
 ## Cross-cutting conventions
 
-- **`Accounting Engine/`** holds all project code; repo root keeps `.gitignore` and the guide.
+- **`Accounting Engine/`** holds all project code, the plans and the guide; repo root keeps only `.gitignore`.
 - `.gitignore` already blocks `*.tfstate`, `azure.env`, `.sftp.env`, `data/`, `*.csv.gz`; will add `config/*/azure.state` and `ui/.streamlit/`.
 - Commits per phase, descriptive messages, pushed to `main`.
 - Nothing is installed, applied, or destroyed without asking you first.
@@ -214,4 +220,5 @@ Run: `task phase1:test` (or `pytest tests/sanity -m azure`).
 - Native SFTP requires **public network access** (ADF managed IR has no fixed egress IP); private networking is Phase-2+ hardening.
 - Unity Catalog metastore is **account-level and region-scoped** — creating it affects the whole subscription in `eastus2`; if one already exists I reuse it rather than create a second.
 - The `python3` on this machine is **3.14**, which may lack wheels for some Spark-adjacent packages. Plan: use a pinned venv (`python3 -m venv`, 3.11/3.12 via Homebrew if 3.14 fails), documented in prerequisites.
-- The untracked guide `.docx` in `Accounting Engine/` — I'll ask whether to commit it there or restore it to the repo root.
+- **Storage firewall vs Databricks compute — to verify in Phase 1.** With `default_action = "Deny"`, job clusters in the workspace's managed VNet may be unable to reach the lake even with the access connector's RBAC in place. Candidate fix is a storage resource-instance rule for the access connector; this is not yet confirmed against Microsoft's docs, so `05_validate_infra.sh` includes a cluster-side read/write probe and the fix is chosen from what that shows.
+- **Commit flow.** "Pushed to `main`" above is your stated convention. The guide's CI story is feature branch → PR → Jenkins gate; if you want the repo history to show that, switch to one PR per phase — your call, not changed here.
